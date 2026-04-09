@@ -45,6 +45,49 @@ double orbitalVel(double mass_central, double r_ndc) {
 
 const float TILT = 0.45f;
 
+struct OrbitRing {
+    unsigned int VAO, VBO;
+    int pointCount;
+    float r, g, b, a;
+
+    OrbitRing(double radius_ndc, float r, float g, float b,
+              float alpha = 0.22f, int points = 256)
+        : r(r), g(g), b(b), a(alpha), pointCount(points)
+    {
+        vector<float> verts;
+        for (int i = 0; i < points; i++) {
+            float angle = 2.0f * PI * i / points;
+            verts.push_back((float)radius_ndc * cos(angle));
+            verts.push_back((float)radius_ndc * sin(angle) * TILT);
+        }
+        glGenVertexArrays(1, &VAO);
+        glGenBuffers(1, &VBO);
+        glBindVertexArray(VAO);
+        glBindBuffer(GL_ARRAY_BUFFER, VBO);
+        glBufferData(GL_ARRAY_BUFFER,
+                     verts.size() * sizeof(float),
+                     verts.data(), GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+                              2 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+    }
+
+    void draw(int offsetLoc, int colorLoc, int scaleLoc,
+              int aspectLoc, float aspect) const {
+        glUniform2f(offsetLoc, 0.0f, 0.0f);
+        glUniform1f(scaleLoc,  1.0f);
+        glUniform4f(colorLoc,  r, g, b, a);
+        glUniform1f(aspectLoc, aspect);
+        glBindVertexArray(VAO);
+        glDrawArrays(GL_LINE_LOOP, 0, pointCount);
+    }
+
+    void cleanup() {
+        glDeleteVertexArrays(1, &VAO);
+        glDeleteBuffers(1, &VBO);
+    }
+};
+
 struct Body {
     double posX, posZ;
     double velX, velZ;
@@ -56,8 +99,6 @@ struct Body {
 
     unsigned int VAO, VBO;
     int segments = 128;
-
-    // visual_radius_override: if > 0, ignore physics radius and use this
     double visual_radius;
 
     Body(double mass, double density,
@@ -77,12 +118,11 @@ struct Body {
 
     void updateRadius() {
         if (visual_radius > 0) {
-            // use the override — physics mass does not affect visual size
             radius_ndc = visual_radius;
         } else {
             double radius_m = cbrt((3.0 * mass / density) / (4.0 * PI));
             radius_ndc = radius_m / SIM_SCALE;
-            radius_ndc = max(radius_ndc, 0.03);
+            radius_ndc = max(radius_ndc, 0.012);
             radius_ndc = min(radius_ndc, 0.28);
         }
     }
@@ -95,7 +135,7 @@ struct Body {
         for (int i = 0; i < segments; i++) {
             float a1 = 2.0f * PI * i       / segments;
             float a2 = 2.0f * PI * (i + 1) / segments;
-            verts.push_back(0.0f); verts.push_back(0.0f);
+            verts.push_back(0.0f);    verts.push_back(0.0f);
             verts.push_back(cos(a1)); verts.push_back(sin(a1));
             verts.push_back(cos(a2)); verts.push_back(sin(a2));
         }
@@ -127,32 +167,36 @@ struct Body {
     }
 };
 
-void merge(Body& a, Body& b) {
+void bounce(Body& a, Body& b, double restitution = 0.8) {
+    double dx   = b.posX - a.posX;
+    double dz   = b.posZ - a.posZ;
+    double dist = sqrt(dx*dx + dz*dz);
+    if (dist == 0) return;
+    double nx = dx / dist;
+    double nz = dz / dist;
+    double dvx = a.velX - b.velX;
+    double dvz = a.velZ - b.velZ;
+    double dvn = dvx * nx + dvz * nz;
+    if (dvn < 0) return;
+    double impulse   = (1.0 + restitution) * dvn / (1.0/a.mass + 1.0/b.mass);
+    a.velX -= impulse / a.mass * nx;
+    a.velZ -= impulse / a.mass * nz;
+    b.velX += impulse / b.mass * nx;
+    b.velZ += impulse / b.mass * nz;
+    double overlap   = (a.radius_ndc + b.radius_ndc) - dist;
     double totalMass = a.mass + b.mass;
-    a.velX = (a.mass * a.velX + b.mass * b.velX) / totalMass;
-    a.velZ = (a.mass * a.velZ + b.mass * b.velZ) / totalMass;
-    a.posX = (a.mass * a.posX + b.mass * b.posX) / totalMass;
-    a.posZ = (a.mass * a.posZ + b.mass * b.posZ) / totalMass;
-    a.mass    = totalMass;
-    a.density = max(a.density, b.density);
-    float ra  = (float)(b.mass / totalMass);
-    a.r = a.r * (1.0f - ra) + b.r * ra;
-    a.g = a.g * (1.0f - ra) + b.g * ra;
-    a.b = a.b * (1.0f - ra) + b.b * ra;
-    // keep visual override on merge
-    a.visual_radius = -1.0; // merged body uses physics radius
-    a.updateRadius();
-    b.alive = false;
+    a.posX -= nx * overlap * (b.mass / totalMass);
+    a.posZ -= nz * overlap * (b.mass / totalMass);
+    b.posX += nx * overlap * (a.mass / totalMass);
+    b.posZ += nz * overlap * (a.mass / totalMass);
 }
 
 void stepPhysics(vector<Body>& bodies, double dt) {
     int n = bodies.size();
-
     for (int i = 0; i < n; i++) {
         if (!bodies[i].alive) continue;
         for (int j = i + 1; j < n; j++) {
             if (!bodies[j].alive) continue;
-
             double dx    = (bodies[j].posX - bodies[i].posX) * SIM_SCALE;
             double dz    = (bodies[j].posZ - bodies[i].posZ) * SIM_SCALE;
             double dist2 = dx*dx + dz*dz;
@@ -160,26 +204,22 @@ void stepPhysics(vector<Body>& bodies, double dt) {
             double soft  = (bodies[i].radius_ndc + bodies[j].radius_ndc)
                            * SIM_SCALE * 0.3;
             double dist2s = dist2 + soft * soft;
-
-            double force = G * bodies[i].mass * bodies[j].mass / dist2s;
+            double force  = G * bodies[i].mass * bodies[j].mass / dist2s;
             double nx = dx / dist;
             double nz = dz / dist;
             double ai = force / bodies[i].mass / SIM_SCALE;
             double aj = force / bodies[j].mass / SIM_SCALE;
-
             bodies[i].velX += nx * ai * dt;
             bodies[i].velZ += nz * ai * dt;
             bodies[j].velX -= nx * aj * dt;
             bodies[j].velZ -= nz * aj * dt;
         }
     }
-
     for (auto& b : bodies) {
         if (!b.alive) continue;
         b.posX += b.velX * dt;
         b.posZ += b.velZ * dt;
     }
-
     for (int i = 0; i < n; i++) {
         if (!bodies[i].alive) continue;
         for (int j = i + 1; j < n; j++) {
@@ -187,20 +227,10 @@ void stepPhysics(vector<Body>& bodies, double dt) {
             double dx   = bodies[j].posX - bodies[i].posX;
             double dz   = bodies[j].posZ - bodies[i].posZ;
             double dist = sqrt(dx*dx + dz*dz);
-            if (dist < bodies[i].radius_ndc + bodies[j].radius_ndc) {
-                if (bodies[i].mass >= bodies[j].mass)
-                    merge(bodies[i], bodies[j]);
-                else
-                    merge(bodies[j], bodies[i]);
-            }
+            if (dist < bodies[i].radius_ndc + bodies[j].radius_ndc)
+                bounce(bodies[i], bodies[j], 0.6);
         }
     }
-
-    bodies.erase(
-        remove_if(bodies.begin(), bodies.end(),
-                  [](const Body& b){ return !b.alive; }),
-        bodies.end()
-    );
 }
 
 unsigned int buildProgram() {
@@ -221,82 +251,6 @@ unsigned int buildProgram() {
     return prog;
 }
 
-vector<Body> makeScene() {
-    const double M_SUN   = 1.989e30;
-    const double M_EARTH = 5.972e24;
-    const double M_MOON  = 7.342e22;
-    const double M_MARS  = 6.39e23;
-
-    // -----------------------------------------------------------
-    // Orbital periods:
-    //   Earth: 365.25 days
-    //   Mars:  687.0  days  (~1.88x Earth)
-    //   Moon:  27.3   days  (around Earth)
-    //
-    // Kepler's 3rd law: T ∝ r^(3/2)
-    // So if Earth orbital radius = R_EARTH in NDC,
-    // Mars radius must satisfy:
-    //   (R_MARS / R_EARTH)^(3/2) = 687/365.25 = 1.881
-    //   R_MARS = R_EARTH * 1.881^(2/3)
-    //          = R_EARTH * 1.524
-    // This is exactly the real ratio (Earth=1AU, Mars=1.524AU)
-    // -----------------------------------------------------------
-    const double R_EARTH = 0.38;
-    const double R_MARS  = R_EARTH * 1.524;   // = 0.579 NDC
-    const double R_MOON  = 0.10;              // around earth
-
-    // const double R_EARTH = 0.88;
-    // const double R_MARS  = R_EARTH * 1.524;   // = 0.579 NDC
-    // const double R_MOON  = 0.10;              // around earth
-
-    cout << "Orbital radii (NDC):" << endl;
-    cout << "  Earth: " << R_EARTH << endl;
-    cout << "  Mars:  " << R_MARS  << "  (ratio=" << R_MARS/R_EARTH << ")" << endl;
-    cout << "  Moon:  " << R_MOON  << " (around earth)" << endl;
-
-    // Orbital velocity from Newton: v = sqrt(G*M/r)
-    // This automatically gives correct relative periods via Kepler
-    double v_earth = orbitalVel(M_SUN,   R_EARTH);
-    double v_mars  = orbitalVel(M_SUN,   R_MARS);
-    double v_moon  = orbitalVel(M_EARTH, R_MOON);
-
-    // Period check — T = 2*pi*r / v
-    // (in real seconds, then divide by 86400 for days)
-    double T_earth = 2.0 * PI * R_EARTH * SIM_SCALE / (v_earth * SIM_SCALE) / 86400.0;
-    double T_mars  = 2.0 * PI * R_MARS  * SIM_SCALE / (v_mars  * SIM_SCALE) / 86400.0;
-    double T_moon  = 2.0 * PI * R_MOON  * SIM_SCALE / (v_moon  * SIM_SCALE) / 86400.0;
-    cout << "\nOrbital periods (real days):" << endl;
-    cout << "  Earth: " << T_earth << "  (real: 365.25)" << endl;
-    cout << "  Mars:  " << T_mars  << "  (real: 687.0)"  << endl;
-    cout << "  Moon:  " << T_moon  << "  (real: 27.3)"   << endl;
-    cout << "  Mars/Earth ratio: " << T_mars/T_earth << "  (real: 1.88)" << endl;
-
-    return {
-        // ---  Sun  ---
-        // mass      dens   posX     posZ    velX    velZ
-        // visual_radius = -1 means use physics calculation
-        { M_SUN,    1408,  0.0,     0.0,    0.0,    0.0,
-          1.0f, 0.92f, 0.2f,
-          -1.0 },        // physics radius (will clamp to 0.28)
-
-        // --- Earth --- starts right (+X), moves into screen (+Z) = CCW
-        { M_EARTH,  5515,  R_EARTH, 0.0,    0.0,    v_earth,
-          0.18f, 0.5f, 1.0f,
-          -1.0 },        // physics radius
-
-        // --- Moon --- starts above earth in Z, moves left (-X) = CCW around earth
-        // IMPORTANT: visual_radius = 0.06 → always visible regardless of mass
-        { M_MOON,   3344,  R_EARTH, R_MOON, -v_moon, v_earth,
-          0.95f, 0.95f, 0.95f,
-          -1.0 },        // ← forced visual size — this is why moon was invisible before
-
-        // --- Mars --- starts left (-X), moves away (-Z) = CCW
-        { M_MARS,   3934, -R_MARS,  0.0,    0.0,    -v_mars,
-          0.9f, 0.35f, 0.1f,
-          -1.0 },        // physics radius
-    };
-}
-
 int main() {
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -305,14 +259,15 @@ int main() {
 
     GLFWmonitor*       monitor = glfwGetPrimaryMonitor();
     const GLFWvidmode* mode    = glfwGetVideoMode(monitor);
-
     GLFWwindow* window = glfwCreateWindow(
-        mode->width, mode->height,
-        "Solar System — Side-Top View", NULL, NULL);
+        mode->width, mode->height, "Solar System", NULL, NULL);
 
     glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     int winW, winH;
     glfwGetFramebufferSize(window, &winW, &winH);
@@ -325,7 +280,132 @@ int main() {
     int scaleLoc  = glGetUniformLocation(program, "uScale");
     int aspectLoc = glGetUniformLocation(program, "uAspect");
 
-    vector<Body> bodies = makeScene();
+    // -------------------------------------------------------
+    // Real AU ratios (Earth = 1 AU):
+    //   Mercury = 0.387 AU
+    //   Venus   = 0.723 AU
+    //   Earth   = 1.000 AU
+    //   Mars    = 1.524 AU
+    //
+    // We set R_EARTH as our base NDC radius and scale others
+    // from it using real AU ratios.
+    // -------------------------------------------------------
+    const double M_SUN     = 1.989e30;
+    const double M_MERCURY = 3.285e23;
+    const double M_VENUS   = 4.867e24;
+    const double M_EARTH   = 5.972e24;
+    const double M_MARS    = 6.39e23;
+
+    const double R_EARTH   = 0.42;               // base NDC radius
+    const double R_MERCURY = R_EARTH * 0.387;    // 0.163 NDC
+    const double R_VENUS   = R_EARTH * 0.723;    // 0.303 NDC
+    const double R_MARS    = R_EARTH * 1.524;    // 0.640 NDC
+
+    double v_mercury = orbitalVel(M_SUN, R_MERCURY);
+    double v_venus   = orbitalVel(M_SUN, R_VENUS);
+    double v_earth   = orbitalVel(M_SUN, R_EARTH);
+    double v_mars    = orbitalVel(M_SUN, R_MARS);
+
+    // Period check: T = 2*pi*r / v (in days)
+    auto periodDays = [&](double r, double v) {
+        return 2.0 * PI * r * SIM_SCALE / (v * SIM_SCALE) / 86400.0;
+    };
+    cout << "Orbital periods:" << endl;
+    cout << "  Mercury: " << periodDays(R_MERCURY, v_mercury) << " d  (real: 88)"   << endl;
+    cout << "  Venus:   " << periodDays(R_VENUS,   v_venus)   << " d  (real: 224.7)"<< endl;
+    cout << "  Earth:   " << periodDays(R_EARTH,   v_earth)   << " d  (real: 365.25)"<< endl;
+    cout << "  Mars:    " << periodDays(R_MARS,    v_mars)    << " d  (real: 687)"   << endl;
+
+    // -------------------------------------------------------
+    // Each planet starts at a different angle so they are
+    // spread around the sun at launch — looks nicer than
+    // all bunched up on the same side.
+    //
+    // Position on orbit at angle theta:
+    //   posX = R * cos(theta)
+    //   posZ = R * sin(theta)
+    // Velocity perpendicular CCW at angle theta:
+    //   velX = -v * sin(theta)
+    //   velZ =  v * cos(theta)
+    // -------------------------------------------------------
+    auto startPos = [](double R, double theta, double v,
+                       double& px, double& pz,
+                       double& vx, double& vz) {
+        px = R * cos(theta);
+        pz = R * sin(theta);
+        vx = -v * sin(theta);  // perpendicular CCW
+        vz =  v * cos(theta);
+    };
+
+    double px, pz, vx, vz;
+
+    // orbit rings — drawn behind everything
+    vector<OrbitRing> rings = {
+        OrbitRing(R_MERCURY, 0.7f,  0.7f,  0.7f,  0.2f), // grey
+        OrbitRing(R_VENUS,   0.9f,  0.7f,  0.3f,  0.2f), // warm yellow
+        OrbitRing(R_EARTH,   0.3f,  0.5f,  1.0f,  0.2f), // blue
+        OrbitRing(R_MARS,    0.9f,  0.4f,  0.2f,  0.2f), // orange
+    };
+
+    // build bodies
+    vector<Body> bodies;
+
+    // Sun
+    bodies.push_back({ M_SUN, 1408,
+                       0.0, 0.0, 0.0, 0.0,
+                       1.0f, 0.92f, 0.2f, 0.035 });
+
+    // Mercury — starts at 0° (right)
+    startPos(R_MERCURY, 0.0, v_mercury, px, pz, vx, vz);
+    bodies.push_back({ M_MERCURY, 5427,
+                       px, pz, vx, vz,
+                       0.72f, 0.70f, 0.68f,  // grey
+                       0.020 });              // tiny but visible
+
+    // Venus — starts at 60°
+    startPos(R_VENUS, PI * 0.33, v_venus, px, pz, vx, vz);
+    bodies.push_back({ M_VENUS, 5243,
+                       px, pz, vx, vz,
+                       0.90f, 0.75f, 0.35f,  // pale orange-yellow
+                       0.023 });
+
+    // Earth — starts at 150°
+    startPos(R_EARTH, PI * 0.83, v_earth, px, pz, vx, vz);
+    bodies.push_back({ M_EARTH, 5515,
+                       px, pz, vx, vz,
+                       0.18f, 0.50f, 1.00f,  // blue
+                       0.025 });
+
+    // Mars — starts at 240°
+    startPos(R_MARS, PI * 1.33, v_mars, px, pz, vx, vz);
+    bodies.push_back({ M_MARS, 3934,
+                       px, pz, vx, vz,
+                       0.90f, 0.35f, 0.10f,  // red-orange
+                       0.035 });
+
+    // lambda to rebuild scene
+    auto resetBodies = [&]() -> vector<Body> {
+        vector<Body> b;
+        b.push_back({ M_SUN, 1408, 0.0, 0.0, 0.0, 0.0,
+                      1.0f, 0.92f, 0.2f, -1.0 });
+
+        startPos(R_MERCURY, 0.0, v_mercury, px, pz, vx, vz);
+        b.push_back({ M_MERCURY, 5427, px, pz, vx, vz,
+                      0.72f, 0.70f, 0.68f, 0.018 });
+
+        startPos(R_VENUS, PI * 0.33, v_venus, px, pz, vx, vz);
+        b.push_back({ M_VENUS, 5243, px, pz, vx, vz,
+                      0.90f, 0.75f, 0.35f, -1.0 });
+
+        startPos(R_EARTH, PI * 0.83, v_earth, px, pz, vx, vz);
+        b.push_back({ M_EARTH, 5515, px, pz, vx, vz,
+                      0.18f, 0.50f, 1.00f, -1.0 });
+
+        startPos(R_MARS, PI * 1.33, v_mars, px, pz, vx, vz);
+        b.push_back({ M_MARS, 3934, px, pz, vx, vz,
+                      0.90f, 0.35f, 0.10f, -1.0 });
+        return b;
+    };
 
     const double TIME_SCALE = 3e6;
     double lastTime = glfwGetTime();
@@ -342,6 +422,12 @@ int main() {
         glClear(GL_COLOR_BUFFER_BIT);
 
         glUseProgram(program);
+
+        // rings first — behind planets
+        for (auto& ring : rings)
+            ring.draw(offsetLoc, colorLoc, scaleLoc, aspectLoc, aspect);
+
+        // planets on top
         for (auto& b : bodies)
             b.draw(offsetLoc, colorLoc, scaleLoc, aspectLoc, aspect);
 
@@ -353,11 +439,12 @@ int main() {
 
         if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
             for (auto& b : bodies) b.cleanup();
-            bodies = makeScene();
+            bodies = resetBodies();
         }
     }
 
-    for (auto& b : bodies) b.cleanup();
+    for (auto& b  : bodies) b.cleanup();
+    for (auto& rg : rings)  rg.cleanup();
     glDeleteProgram(program);
     glfwTerminate();
     return 0;
